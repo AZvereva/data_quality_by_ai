@@ -36,7 +36,6 @@ This guide establishes protocols for preventing such scenarios. It does not rely
 - [Checklists](#checklists)
 - [Personal Experience](#personal-experience)
 - [AI Collaboration Disclosure](#ai-collaboration-disclosure)
-- [Principle](#principle)
 ---
 
 ## Part 1: Incoming Data is Dirty
@@ -296,16 +295,12 @@ SELECT revenue / NULLIF(orders, 0) as aov FROM metrics;
 **Consequences:** Double-counting from duplicates. Averages skewed by outliers. Counts include NULLs when they shouldn't.  
 **Decision:** Clean before aggregating. Verify row uniqueness. Check denominator in averages.
 
-```sql
--- Check: Are you counting duplicates?
-WITH deduped AS (
-    SELECT DISTINCT customer_id, order_date, amount
-    FROM orders
-)
-SELECT 
-    (SELECT COUNT(*) FROM orders) as raw_count,
-    (SELECT COUNT(*) FROM deduped) as deduped_count,
-    (SELECT COUNT(*) FROM orders) - (SELECT COUNT(*) FROM deduped) as duplicate_rows;
+-- To inspect specific duplicates (limited output)
+SELECT customer_id, order_date, amount, COUNT(*) as occurrences
+FROM orders
+GROUP BY customer_id, order_date, amount
+HAVING COUNT(*) > 1
+LIMIT 100;
 ```
 
 ### Date Arithmetic Errors
@@ -334,22 +329,28 @@ FROM customers;
 
 ### Implicit Cast Failures
 
-**Problem:** Database implicitly casts types, producing unexpected results.  
-**Consequences:** '2024-01-01' > '2024-1-1' (string comparison vs date). 5 / 2 = 2 (integer division).  
-**Decision:** Explicit casts for all type conversions.
+**Problem:** Database implicitly casts types, producing unexpected results, or you explicitly cast in performance-critical contexts.  
+**Consequences:** '2024-01-01' > '2024-1-1' (string comparison vs date). 5 / 2 = 2 (integer division). Worse: casting in JOINs or WHERE clauses disables indexes, causing full table scans on large tables.  
+**Decision:** Store data as correct types from ingestion. Cast only in final SELECT or in CTEs/materialized tables, never in JOINs or WHERE clauses on source tables.
 
 ```sql
--- WRONG: Implicit string comparison
-SELECT * FROM orders WHERE order_date > '2024-01-01';  -- String comparison, not date
+-- WRONG: Implicit string comparison (works but risky)
+SELECT * FROM orders WHERE order_date > '2024-01-01';  
 
--- RIGHT: Explicit cast
-SELECT * FROM orders WHERE order_date > '2024-01-01'::DATE;
+-- WRONG: Cast in WHERE (disables index, full scan)
+SELECT * FROM orders WHERE order_date > '2024-01-01'::DATE;  
 
--- WRONG: Integer division
-SELECT 5 / 2 as wrong_result;  -- Returns 2
+-- RIGHT: Ensure column is DATE type, compare to literal
+-- (Literal '2024-01-01' is implicitly cast to DATE once, not per-row)
+SELECT * FROM orders WHERE order_date > '2024-01-01';
 
--- RIGHT: Explicit decimal
-SELECT 5::DECIMAL / 2::DECIMAL as correct_result;  -- Returns 2.5
+-- RIGHT: Cast only in final output, not in filter/join
+SELECT 
+    order_id,
+    order_date,
+    amount::DECIMAL(12,2) as amount_decimal  -- Safe: final projection only
+FROM orders
+WHERE order_date > '2024-01-01';  -- No cast, index-friendly
 ```
 
 ### Circular References
@@ -446,9 +447,3 @@ FROM source s, transformed t;
 ## AI Collaboration Disclosure
 
 "In creating this document, I collaborated with Kimi to assist with drafting, structure, and technical editing. I affirm that all AI-generated and co-created content underwent thorough review and evaluation. The final output accurately reflects my understanding, expertise, and intended meaning. While AI assistance was instrumental in the process, I maintain full responsibility for the content, its accuracy, and its presentation. This disclosure is made in the spirit of transparency and to acknowledge the role of AI in the creation process."
-
----
-
-## Principle
-
-Dirty data is the default. Clean data requires explicit decisions at every step.
