@@ -13,10 +13,10 @@ This guide establishes protocols for preventing such scenarios. It does not rely
 ---
 
 ## Table of Contents
-
 - [Why This Matters](#why-this-matters)
 - [Part 1: Incoming Data is Dirty](#part-1-incoming-data-is-dirty)
   - [Schema Drift](#schema-drift)
+  - [Schema Evolution Safety](#schema-evolution-safety)
   - [Volume Anomalies](#volume-anomalies)
   - [Data Freshness](#data-freshness)
   - [Duplicate Records](#duplicate-records)
@@ -39,20 +39,22 @@ This guide establishes protocols for preventing such scenarios. It does not rely
   - [Post-Transform Reconciliation](#post-transform-reconciliation)
 - [Part 3: Monitoring & Alerting](#part-3-monitoring--alerting)
   - [DWH Architecture for Quality](#dwh-architecture-for-quality)
+  - [Data Lineage Mapping](#data-lineage-mapping)
+  - [Quarantine Performance Guardrails](#quarantine-performance-guardrails)
   - [Monitoring Methods](#monitoring-methods)
   - [Alerting Channels](#alerting-channels)
-- [Checklists](#checklists)
+  - [Runbook Automation](#runbook-automation)
+  - [Checklists](#checklists)
+- [Personal Experience](#personal-experience)
 - [AI Collaboration Disclosure](#ai-collaboration-disclosure)
 
 ---
 
 ## Part 1: Incoming Data is Dirty
-
 Problems caused by sources you don't control. Fix or flag before any transformation.
 
-**DWH Approach:** Apply all checks in **staging layer** (raw data landing zone). Implement as views or ephemeral models that filter/quarantine bad records before persistence. Never allow dirty data into core warehouse tables. Use separate `quarantine` schema for rejected records with full audit trail.
-
-**Monitoring:** Automated dbt tests on staging models, separate `data_quality` schema with rejected records, freshness checks in orchestrator (Airflow/Dagster), schema validation via source contracts.
+**DWH Approach:** Apply all checks in staging layer (raw data landing zone). Implement as views or ephemeral models that filter/quarantine bad records before persistence. Never allow dirty data into core warehouse tables. Use separate `quarantine` schema for rejected records with full audit trail.  
+**Monitoring:** `[Execution Context: SQL is the validation logic. dbt/Airflow/CI systems schedule and report these standard queries.]` Automated tests on staging models, separate `data_quality` schema with rejected records, freshness checks in orchestrator, schema validation via source contracts.
 
 ### Schema Drift
 
@@ -70,23 +72,39 @@ FROM information_schema.columns
 WHERE table_name = 'your_table'
 ORDER BY ordinal_position;
 ```
+### Schema Evolution Safety
+
+**Problem:** `ALTER TABLE ... ADD COLUMN` breaks downstream pipelines or causes full table rewrites when adding non-nullable fields.  
+**Consequences:** Pipeline halts on deployment. Backfill scripts lock tables. Reports break during transition windows.  
+**Decision:** Always add columns as nullable with defaults, backfill asynchronously, then enforce constraints.  
+**DWH Approach:** Staging/Intermediate layer: 3-step evolution pattern. Never add `NOT NULL` without a default or backfill job.  
+**Monitoring:** `[Execution Context: CI/CD pipeline runs validation SQL]` `schema_evolution_log` tracking migration steps; pipeline blocking if `ALTER` lacks nullable default or backfill reference.
+
+```
+-- STEP 1: Add nullable column (zero-downtime, no table lock)
+ALTER TABLE staging.orders ADD COLUMN discount_code VARCHAR(50);
+
+-- STEP 2: Backfill asynchronously (run as separate job)
+UPDATE staging.orders 
+SET discount_code = 'DEFAULT' 
+WHERE discount_code IS NULL AND order_date >= '2024-01-01';
+
+-- STEP 3: Enforce constraint once backfill completes
+ALTER TABLE staging.orders ALTER COLUMN discount_code SET NOT NULL;
+```
 
 ### Volume Anomalies
-
 **Problem:** Row counts change unexpectedly.  
 **Consequences:** 50% drop = upstream pipeline broke. 300% spike = duplicate data. Zero rows = silent failure. All lead to wrong business decisions.  
-**Decision:** Compare today's count to historical average. Stop if deviation > 20%.
-
-**DWH Approach:** Staging layer row count validation before `INSERT`. Use `COUNT(*)` in pre-flight CTE; abort load if outside tolerance.
-
-**Monitoring:** Time-series table `volume_metrics` (date, table_name, row_count, z_score); BI dashboard with 7-day rolling bands; pager alert on 3-sigma deviation.
-
+**Decision:** Compare today's count to historical average. Stop if deviation > 20%.  
+**DWH Approach:** Staging layer row count validation before `INSERT`. Use `COUNT(*)` in pre-flight CTE; abort load if outside tolerance.  
+**Monitoring:** `[Execution Context: Scheduler compares historical SQL outputs]` Time-series table `volume_metrics` (date, table_name, row_count, z_score); BI dashboard with 7-day rolling bands; pager alert on 3-sigma deviation.
 ```sql
--- Optimized: Single scan, no CTE materialization
+-- Optimized: Single scan, dialect-agnostic duplicate detection
 SELECT 
     COUNT(*) as raw_count,
-    COUNT(DISTINCT (customer_id, order_date, amount)) as unique_combinations,
-    COUNT(*) - COUNT(DISTINCT (customer_id, order_date, amount)) as duplicate_rows
+    COUNT(DISTINCT customer_id || '|' || order_date || '|' || amount) as unique_combinations,
+    COUNT(*) - COUNT(DISTINCT customer_id || '|' || order_date || '|' || amount) as duplicate_rows
 FROM orders;
 ```
 
@@ -346,15 +364,11 @@ HAVING flag != 'OK';
 ```
 
 ### Outliers
-
 **Problem:** Values statistically valid but business-impossible (e.g., $1M order when max is $10K).  
 **Consequences:** Means skewed. Aggregations misleading. Fraud or errors hidden.  
-**Decision:** Flag values beyond N standard deviations or percentile thresholds.
-
-**DWH Approach:** Staging layer: Statistical profiling in separate `outlier_detection` CTE; flag but don't remove (business decision); pass flag to mart layer.
-
-**Monitoring:** `outlier_summary` table (date, column, outlier_count, threshold_used); BI dashboard with outlier trend lines; fraud investigation alerts on extreme outliers.
-
+**Decision:** Flag values beyond N standard deviations or percentile thresholds.  
+**DWH Approach:** Staging layer: Statistical profiling in separate `outlier_detection` CTE; flag but don't remove (business decision); pass flag to mart layer.  
+**Monitoring:** `[Execution Context: Scheduler runs anomaly SQL]` `outlier_summary` table (date, column, outlier_count, threshold_used); BI dashboard with outlier trend lines; fraud investigation alerts on extreme outliers.
 ```sql
 -- Flag statistical outliers (beyond 3 standard deviations)
 WITH stats AS (
@@ -367,6 +381,7 @@ SELECT
     o.order_id,
     o.order_amount,
     CASE 
+        WHEN s.std_val = 0 THEN 0
         WHEN ABS(o.order_amount - s.mean_val) > 3 * s.std_val THEN 'OUTLIER'
         ELSE 'OK'
     END as flag
@@ -399,12 +414,10 @@ FROM table;
 ---
 
 ## Part 2: Adjusting Data for Analysis
-
 Problems caused by your own transformations. Prevent errors in calculations and aggregations.
 
-**DWH Approach:** Apply in **intermediate/mart layer**. Use ephemeral models for transformation logic; persist quality checks in `audit` schema. Reconciliation tables comparing source → staging → mart totals.
-
-**Monitoring:** dbt tests on all marts, Great Expectations/Elementary for complex rules, BI dashboard showing "data health score" by mart.
+**DWH Approach:** Apply in intermediate/mart layer. Use ephemeral models for transformation logic; persist quality checks in `audit` schema. Reconciliation tables comparing source → staging → mart totals.  
+**Monitoring:** `[Execution Context: SQL is the validation logic. Test runners/BI platforms schedule and surface these queries.]` Tests on all marts, complex rule checks via SQL wrappers, BI dashboard showing "data health score" by mart.
 
 ### Division by Zero
 
@@ -651,6 +664,94 @@ CREATE TABLE audit.schema_changes (
 );
 ```
 
+### Data Lineage Mapping
+**Problem:** Quality checks exist in isolation; when a test fails, engineers struggle to trace which upstream source or downstream report is impacted.  
+**Consequences:** Slow incident response. Unintended downstream breaks. Difficulty prioritizing fixes based on business impact.  
+**Decision:** Maintain a SQL-based metadata registry linking every check to its source column, transformation, and downstream consumers.  
+**DWH Approach:** Intermediate/Mart layer: `quality_checks_lineage` table populated via automated SQL queries against `information_schema` and test metadata. Query this table during alerting to attach downstream impact directly to notifications.  
+**Monitoring:** `[Execution Context: CI/CD runs lineage SQL]` `quality_lineage_report` view; alerts include "Impacts: mart.revenue_daily, executive_dashboard"; automated dependency graph generation.
+```
+-- Lineage registry (enforce uniqueness to prevent duplicates on re-runs)
+CREATE TABLE IF NOT EXISTS audit.quality_checks_lineage (
+    check_id SERIAL PRIMARY KEY,
+    check_name VARCHAR(100),
+    source_schema VARCHAR(50),
+    source_table VARCHAR(100),
+    source_column VARCHAR(100),
+    downstream_schema VARCHAR(50),
+    downstream_table VARCHAR(100),
+    impact_level VARCHAR(20),  -- 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'
+    UNIQUE(check_name, source_table, source_column, downstream_table)
+);
+
+-- STEP 1: Ingest test metadata & downstream dependencies 
+-- (These can be auto-generated from dbt/CI YAML parsers into simple staging tables)
+CREATE TEMP TABLE test_catalog AS VALUES
+    ('null_check', 'staging', 'orders', 'customer_id', 'HIGH'),
+    ('uniqueness_check', 'staging', 'orders', 'order_id', 'CRITICAL'),
+    ('volume_check', 'staging', 'orders', '*', 'MEDIUM');
+
+CREATE TEMP TABLE downstream_deps AS VALUES
+    ('staging', 'orders', 'mart', 'daily_revenue'),
+    ('staging', 'orders', 'mart', 'order_facts');
+
+-- STEP 2: Automated population using information_schema for validation & expansion
+INSERT INTO audit.quality_checks_lineage (
+    check_name, source_schema, source_table, source_column,
+    downstream_schema, downstream_table, impact_level
+)
+SELECT DISTINCT
+    c.check_name,
+    c.table_schema AS source_schema,
+    c.table_name AS source_table,
+    i.column_name AS source_column,
+    d.downstream_schema,
+    d.downstream_table,
+    c.impact_level
+FROM test_catalog c
+JOIN information_schema.columns i 
+  ON c.table_schema = i.table_schema 
+  AND c.table_name = i.table_name 
+  AND (c.column_name = '*' OR c.column_name = i.column_name)
+JOIN downstream_deps d 
+  ON c.table_schema = d.source_schema 
+  AND c.table_name = d.source_table
+ON CONFLICT (check_name, source_table, source_column, downstream_table) DO UPDATE
+SET impact_level = EXCLUDED.impact_level;
+
+-- STEP 3: Trace impact on failure (used by alerting pipeline)
+SELECT downstream_table, impact_level, check_name
+FROM audit.quality_checks_lineage
+WHERE source_table = 'orders' AND source_column = 'amount';
+```
+
+### Quarantine Performance Guardrails
+**Problem:** `JSONB` quarantine tables grow unbounded, causing slow joins, high storage costs, and index bloat over time.  
+**Consequences:** Pipeline latency increases. Storage bills spike. Engineers avoid querying quarantine for debugging.  
+**Decision:** Partition quarantine tables by ingestion date, index rejection reasons, and automate archival to cold storage.  
+**DWH Approach:** Staging layer: Range-partition quarantine tables by `rejected_at` or `load_batch_id`. Create targeted indexes on high-cardinality filter columns. Schedule monthly SQL archival jobs.  
+**Monitoring:** `[Execution Context: Scheduler runs maintenance SQL]` `quarantine_size_metrics` table; alerts when partition exceeds threshold; automated `VACUUM`/`REINDEX` tracking.
+```sql
+-- Partition quarantine by month for query performance & archival
+CREATE TABLE quarantine.rejected_orders (
+    raw_data JSONB,
+    rejection_reason VARCHAR(100),
+    check_name VARCHAR(50),
+    rejected_at TIMESTAMP NOT NULL,
+    source_table VARCHAR(50)
+) PARTITION BY RANGE (rejected_at);
+
+-- Create monthly partitions
+CREATE TABLE quarantine.rejected_orders_2024_01 PARTITION OF quarantine.rejected_orders
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+-- Index for fast filtering during investigations
+CREATE INDEX idx_quarantine_reason ON quarantine.rejected_orders(rejection_reason, rejected_at);
+
+-- Archive old partitions (run monthly via scheduler)
+-- ALTER TABLE quarantine.rejected_orders_2023_01 SET TABLESPACE cold_storage;
+```
+
 ### Monitoring Methods
 
 **1. Table Constraints (Hard Enforcement)**
@@ -681,10 +782,9 @@ ALTER TABLE orders ALTER COLUMN order_date SET NOT NULL;
 
 **Monitoring:** Constraint violation logs in Postgres; `pg_constraint` catalog queries; immediate pipeline failure on violation.
 
-**2. dbt Tests (Soft Enforcement)**
-
-Configurable validation without blocking. Standard: uniqueness, not_null, accepted_values, relationships. Custom: SQL-based business rules.
-
+2. **dbt Tests (Soft Enforcement)**  
+Configurable validation without blocking. Standard: uniqueness, not_null, accepted_values, relationships. Custom: SQL-based business rules.  
+*Note: dbt parses and executes the exact SQL patterns shown in this guide. It does not introduce new validation paradigms.*
 ```yaml
 # schema.yml
 models:
@@ -705,10 +805,6 @@ models:
               min_value: 0
               max_value: 1000000
 ```
-
-**When to use:** Staging/intermediate layers; rapid iteration; warnings before hard constraints. Elementary package provides anomaly detection and schema change detection.
-
-**Monitoring:** dbt artifacts parsed into `elementary` schema; HTML dashboard generated via CLI showing test history and trends.
 
 **3. Separate QA Tables (Audit Trail)**
 
@@ -788,12 +884,11 @@ SELECT cron.schedule('refresh_health_score', '*/15 * * * *',
 
 **When to use:** Business stakeholder communication, executive summaries, self-service quality visibility.
 
-**5. Anomaly Detection (Statistical)**
-
-ML-based detection of patterns humans miss. Requires historical baseline.
-
+5. **Anomaly Detection (Statistical)**  
+Pattern detection requiring historical baseline.  
+*Note: Packages like Great Expectations or Elementary parse and run the exact SQL shown below. They do not replace the statistical logic.*
 ```sql
--- Z-score calculation for anomaly detection
+-- Z-score calculation for anomaly detection (safe division)
 WITH stats AS (
     SELECT 
         table_name,
@@ -809,17 +904,19 @@ SELECT
     m.check_name,
     m.metric_value,
     s.mean_val,
-    (m.metric_value - s.mean_val) / NULLIF(s.std_val, 0) as z_score,
     CASE 
-        WHEN ABS((m.metric_value - s.mean_val) / NULLIF(s.std_val, 0)) > 3 
+        WHEN s.std_val = 0 THEN 0
+        ELSE (m.metric_value - s.mean_val) / s.std_val
+    END as z_score,
+    CASE 
+        WHEN s.std_val = 0 THEN 'NORMAL'
+        WHEN ABS((m.metric_value - s.mean_val) / s.std_val) > 3 
         THEN 'ANOMALY' ELSE 'NORMAL' 
     END as status
 FROM audit.daily_quality_metrics m
 JOIN stats s ON m.table_name = s.table_name AND m.check_name = s.check_name
 WHERE m.check_date = CURRENT_DATE;
 ```
-
-**When to use:** High-volume tables, subtle drift detection, fraud detection, automated threshold adjustment. Elementary provides built-in anomaly detection for dbt tests.
 
 ### Alerting Channels
 
@@ -912,13 +1009,45 @@ SELECT
 FROM audit.daily_quality_metrics
 WHERE check_date = CURRENT_DATE;
 ```
+### Runbook Automation
+**Problem:** Alerts trigger without clear next steps. Engineers waste time investigating known issues or guessing remediation paths.  
+**Consequences:** Extended MTTR. Alert fatigue. Repeated fire-fighting instead of systemic fixes.  
+**Decision:** Link every alert severity and check type to a predefined runbook ID with auto-remediation scripts where safe.  
+**DWH Approach:** Intermediate layer: `runbook_mappings` table mapping `check_name` + `status` to `runbook_url`, `auto_fix_sql`, and `owner`. Orchestrator appends runbook ID to alert payloads automatically.  
+**Monitoring:** `[Execution Context: Scheduler joins alerts to runbook SQL]` `runbook_hit_rate` tracking; weekly review of unused runbooks; auto-execution logs for safe remediations.
+```
+-- Runbook mapping table
+CREATE TABLE audit.runbook_mappings (
+    check_name VARCHAR(100) PRIMARY KEY,
+    severity VARCHAR(20),
+    runbook_id VARCHAR(50),
+    runbook_url TEXT,
+    auto_remediation_sql TEXT,  -- e.g., "REFRESH MATERIALIZED VIEW..."
+    owner_team VARCHAR(100),
+    is_auto_executable BOOLEAN DEFAULT FALSE
+);
+
+-- Query to enrich alerts with runbook context
+SELECT 
+    a.check_name,
+    a.table_name,
+    a.status,
+    a.metric_value,
+    r.runbook_id,
+    r.runbook_url,
+    r.auto_remediation_sql,
+    r.owner_team
+FROM audit.data_quality_log a
+LEFT JOIN audit.runbook_mappings r ON a.check_name = r.check_name
+WHERE a.status = 'FAIL' AND a.check_timestamp >= CURRENT_TIMESTAMP - INTERVAL '1 hour';
+```
 
 ---
 
-## Checklists
-
-### Before Every Commit
+### Checklists
+**Before Every Commit**
 - [ ] Schema unchanged (staging source contracts passing)
+- [ ] Schema evolution follows 3-step pattern (nullable → backfill → constrain)
 - [ ] Volume in expected range (±20% of 30-day average)
 - [ ] No duplicates in source (uniqueness tests passing)
 - [ ] No orphans in joins (relationship tests passing)
@@ -936,8 +1065,9 @@ WHERE check_date = CURRENT_DATE;
 - [ ] Date arithmetic validated (no negative ages/future dates)
 - [ ] Source totals reconciled (variance < 0.1%)
 - [ ] Quarantine tables reviewed (no unexpected rejects)
+- [ ] Check mapped to runbook ID in `audit.runbook_mappings`
 
-### Weekly Review
+**Weekly Review**
 - [ ] All freshness checks passing (SLA compliance > 99%)
 - [ ] No new orphan records (referential integrity stable)
 - [ ] Distribution shapes unchanged (no drift in key metrics)
@@ -946,18 +1076,20 @@ WHERE check_date = CURRENT_DATE;
 - [ ] Documentation updated with new edge cases found
 - [ ] Reconciliation variance trend analyzed
 - [ ] Schema change log reviewed (any unplanned alterations?)
+- [ ] Quarantine indexes healthy (no bloat, partitions archived)
 
-### Monthly Governance
+**Monthly Governance**
 - [ ] Data quality metrics reported to stakeholders via BI dashboard
 - [ ] SLA breach root cause analysis completed
 - [ ] Quarantine table cleanup (archive old rejects > 30 days)
 - [ ] Audit table retention (archive > 90 days to cold storage)
 - [ ] Constraint performance impact reviewed (drop if causing issues)
 - [ ] Monitoring coverage gaps identified
-- [ ] Alert runbooks updated
+- [ ] Alert runbooks updated and auto-remediation tested
 - [ ] Data steward review meeting completed
+- [ ] Lineage map audited for orphaned checks or missing downstream impacts
 
 ## AI Collaboration Disclosure
 
-"In creating this document, I collaborated with Kimi to assist with drafting, structure, and technical editing. I affirm that all AI-generated and co-created content underwent thorough review and evaluation. The final output accurately reflects my understanding, expertise, and intended meaning. While AI assistance was instrumental in the process, I maintain full responsibility for the content, its accuracy, and its presentation. This disclosure is made in the spirit of transparency and to acknowledge the role of AI in the creation process."
+"In creating this document, I collaborated with Kimi, Qwen to assist with drafting, structure, and technical editing. I affirm that all AI-generated and co-created content underwent thorough review and evaluation. The final output accurately reflects my understanding, expertise, and intended meaning. While AI assistance was instrumental in the process, I maintain full responsibility for the content, its accuracy, and its presentation. This disclosure is made in the spirit of transparency and to acknowledge the role of AI in the creation process."
 
