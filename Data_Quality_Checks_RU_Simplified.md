@@ -124,6 +124,7 @@ GROUP BY id
 HAVING COUNT(*) > 1;
 
 -- Исправление: Удалите дубликаты перед агрегацией
+-- Селект *, правда, позьмет еще и поле rn. Поэтому не забывайте про совет в начале избегать выбора через *, всегда прописывайте нужные поля!
 SELECT * FROM (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_at DESC) as rn
     FROM your_table
