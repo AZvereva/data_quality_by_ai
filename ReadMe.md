@@ -2,7 +2,7 @@
 
 ## Repo content
 - Data_quality_Checks_Simplified.md is for junior specialists onboarding or just brief review (Data_quality_Checks_RU_Simplified.md in Russian language)
-- Data_Quality_Checks_Extended.md contains detailed blocks of code
+- Data_Quality_Checks_Extended.md contains detailed blocks of code and guiding.
 - Data_Quality_Checks_formatted.md is the reformatted version of Data_Quality_Checks_Extended.md with collapsible blocks and slightly different layout
 
 
