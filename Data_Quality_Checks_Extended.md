@@ -147,6 +147,13 @@ SELECT email, COUNT(DISTINCT customer_id)
 FROM customers 
 GROUP BY email 
 HAVING COUNT(DISTINCT customer_id) > 1;
+
+-- Fix: Deduplicate before aggregating
+-- Select * will also return rn. So getting back to rule above - always be explicit in select statement about the fileds to return!
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_at DESC) as rn
+    FROM your_table
+) WHERE rn = 1;
 ```
 
 ### Orphan Records
